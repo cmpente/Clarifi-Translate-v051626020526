@@ -1,0 +1,7 @@
+{
+  "name": "Remix: Clarifi Translate v051626020526",
+  "description": "Real-time, low-latency voice translation app.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
