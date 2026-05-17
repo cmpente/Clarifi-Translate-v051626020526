@@ -1,19 +1,9 @@
-import { useEffect, useRef, useCallback } from 'react';
+import { useRef, useCallback } from 'react';
 import { useAudioStore } from '@/store/audio-store';
 import { v4 as uuidv4 } from 'uuid';
 import { GoogleGenAI, LiveServerMessage, Modality } from "@google/genai";
 
-const SYSTEM_INSTRUCTION = `You are an expert simultaneous speech-to-speech interpreter. Your sole purpose is to translate continuous audio streams between English and the interlocutor's language (e.g., French, Spanish, Haitian Creole, Bosnian) with zero conversational padding.
-
-CRITICAL RULES:
-1. Act as a transparent, objective conduit. Translate exactly what is said in the first person. Do not use third-person descriptors (e.g., never say "He says...").
-2. Never answer questions, act as an assistant, or engage in conversation. If the user asks a question, you must translate the question.
-3. Maintain the original speaker's emotional state, pacing, and urgency in your translated audio.
-4. Do not add introductory phrases, filler, or meta-commentary (e.g., never say "Translating that:" or "Here is the translation:").
-5. Translate everything accurately, including idioms, slang, and profanity, without editorializing or censoring.
-6. If the audio is completely unintelligible due to noise, output "[Unintelligible audio detected. Please repeat.]" in the target language.
-7. You have no identity, personality, or opinions. Never refer to yourself as an AI or an interpreter.
-8. SIMULTANEOUS INTERPRETATION: Begin target-language output as soon as the meaning is stable. Do not wait for full sentence completion if a faithful clause-level interpretation can begin earlier. Output partial translations continuously and overlap your translation with the speaker's ongoing speech.`;
+const SYSTEM_INSTRUCTION = `You are a simultaneous, real-time speech-to-speech interpreter. The input is a continuous, uninterrupted stream of human speech. Translate the incoming audio into English immediately. Output your translation as a continuous audio stream. Do not wait for the speaker to finish their paragraph. Stream translations with a maximum delay of 2 seconds behind the speaker.`;
 
 export function useAudioTranslation() {
   const { setState, setVolume, setError, updateTranscript, setActiveTranscript, setActiveDeviceLabel } = useAudioStore();
@@ -40,17 +30,12 @@ export function useAudioTranslation() {
   const currentTurnTextRef = useRef<string>('');
   const currentSourceTextRef = useRef<string>('');
   const currentTurnIdRef = useRef<string>(uuidv4());
-  const pauseTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-
-  const lastModelActivityRef = useRef<number>(0);
-  const isCommittedRef = useRef<boolean>(false);
 
   const commitTranscript = useCallback(() => {
-    if (isCommittedRef.current) return;
-    
     const fullText = currentTurnTextRef.current.trim();
     const sourceText = currentSourceTextRef.current.trim();
     const { voiceName } = useAudioStore.getState();
+    
     if (fullText || sourceText) {
       updateTranscript(currentTurnIdRef.current, sourceText, fullText, true, voiceName);
     }
@@ -59,29 +44,13 @@ export function useAudioTranslation() {
     currentSourceTextRef.current = '';
     currentTurnIdRef.current = uuidv4();
     setActiveTranscript('');
-    isCommittedRef.current = true;
   }, [updateTranscript, setActiveTranscript]);
-
-  useEffect(() => {
-    const interval = setInterval(() => {
-      const now = Date.now();
-      if (
-        !isCommittedRef.current &&
-        currentTurnTextRef.current.trim() !== '' &&
-        now - lastModelActivityRef.current > 800
-      ) {
-        commitTranscript();
-      }
-    }, 200);
-    return () => clearInterval(interval);
-  }, [commitTranscript]);
 
   const playAudioChunk = useCallback(async (base64Data: string) => {
     if (!outputAudioCtxRef.current) return;
     
     const ctx = outputAudioCtxRef.current;
     
-    // Decode base64 to ArrayBuffer
     const binaryString = window.atob(base64Data);
     const len = binaryString.length;
     const bytes = new Uint8Array(len);
@@ -91,11 +60,9 @@ export function useAudioTranslation() {
     
     const pcm16 = new Int16Array(bytes.buffer);
     
-    // Check for WAV header (RIFF)
     let dataOffset = 0;
     if (bytes[0] === 82 && bytes[1] === 73 && bytes[2] === 70 && bytes[3] === 70) {
-      // It's a WAV file, skip the 44-byte header
-      dataOffset = 22; // 44 bytes = 22 Int16s
+      dataOffset = 22; 
     }
     
     const audioLength = pcm16.length - dataOffset;
@@ -128,12 +95,11 @@ export function useAudioTranslation() {
 
     const currentTime = ctx.currentTime;
     if (playbackTimeRef.current < currentTime) {
-      playbackTimeRef.current = currentTime + 0.04; // 20ms latency buffering to prevent underrun
+      playbackTimeRef.current = currentTime + 0.04; 
     }
     
     source.start(playbackTimeRef.current);
     
-    // Adjust duration based on playback rate
     const actualDuration = audioBuffer.duration / voiceRate;
     playbackTimeRef.current += actualDuration;
   }, []);
@@ -150,9 +116,7 @@ export function useAudioTranslation() {
       }
       setState('CONNECTING');
       playbackTimeRef.current = 0;
-      isCommittedRef.current = false;
       
-      // 1. Primer stream device initialization
       try {
         const primerStream = await navigator.mediaDevices.getUserMedia({ audio: true });
         primerStream.getTracks().forEach(track => track.stop());
@@ -160,20 +124,30 @@ export function useAudioTranslation() {
         console.warn('Primer stream failed', err);
       }
 
-      // 2. Preferred microphone selection
       let targetDeviceId = deviceId;
       if (!targetDeviceId) {
         try {
           const devices = await navigator.mediaDevices.enumerateDevices();
           const audioInputs = devices.filter(d => d.kind === 'audioinput');
+          // Prefer built-in phone microphone (avoiding Bluetooth headsets so we can hear the room)
           const preferredInput = audioInputs.find(d => 
-            d.label.toLowerCase().includes('bluetooth') ||
-            d.label.toLowerCase().includes('airpods') ||
-            d.label.toLowerCase().includes('buds') ||
-            d.label.toLowerCase().includes('headset')
+            d.label.toLowerCase().includes('built-in') ||
+            d.label.toLowerCase().includes('internal') ||
+            d.label.toLowerCase().includes('iphone') ||
+            d.label.toLowerCase().includes('phone')
           );
           if (preferredInput) {
             targetDeviceId = preferredInput.deviceId;
+          } else {
+            // Default to first available non-Bluetooth input if possible
+            const nonBluetooth = audioInputs.find(d => 
+              !d.label.toLowerCase().includes('bluetooth') &&
+              !d.label.toLowerCase().includes('airpods') &&
+              !d.label.toLowerCase().includes('buds')
+            );
+            if (nonBluetooth) {
+              targetDeviceId = nonBluetooth.deviceId;
+            }
           }
         } catch (err) {
           console.warn('Failed to enumerate devices for preferred input', err);
@@ -182,10 +156,6 @@ export function useAudioTranslation() {
 
       let stream: MediaStream;
       try {
-        // 3. Bluetooth-safe microphone constraints
-        // Disabling these constraints prevents mobile OSes (iOS/Android) from
-        // switching to the "communications" audio profile (phone call mode),
-        // which forces audio to the speakerphone/earpiece and lowers quality.
         const audioConstraints: MediaTrackConstraints = {
           echoCancellation: false,
           noiseSuppression: false,
@@ -202,7 +172,6 @@ export function useAudioTranslation() {
         });
       }
       
-      // 4. Android Bluetooth keep-alive behavior
       const isAndroid = /Android/i.test(navigator.userAgent);
       if (isAndroid) {
         const keepAliveAudio = new Audio();
@@ -220,17 +189,14 @@ export function useAudioTranslation() {
       
       streamRef.current = stream;
       
-      // Get the label of the active track
       const track = stream.getAudioTracks()[0];
       const label = track.label || 'Unknown Microphone';
       const formattedLabel = label.split(' ').map((word: string) => word.charAt(0).toUpperCase() + word.slice(1)).join(' ');
       setActiveDeviceLabel(formattedLabel);
       
-      // Input context at 16kHz for Gemini
       const inputAudioCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
       inputAudioCtxRef.current = inputAudioCtx;
 
-      // Output context at 24kHz for playback
       const outputAudioCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
       outputAudioCtxRef.current = outputAudioCtx;
       
@@ -247,7 +213,6 @@ export function useAudioTranslation() {
       masterOutput.connect(outputAnalyser);
       outputAnalyser.connect(outputAudioCtx.destination);
       
-      // 5. Output sink selection
       const setOutputSink = async () => {
         if (isAndroid) return;
         try {
@@ -265,7 +230,6 @@ export function useAudioTranslation() {
 
           if (typeof (outputAudioCtx as any).setSinkId === 'function') {
             await (outputAudioCtx as any).setSinkId(targetOutputId);
-            console.log('Audio routed to output:', preferredOutput?.label || 'default');
           } else {
             if (!audioElementRef.current) {
               const destNode = outputAudioCtx.createMediaStreamDestination();
@@ -280,7 +244,6 @@ export function useAudioTranslation() {
             }
             if (typeof (audioElementRef.current as any).setSinkId === 'function') {
               await (audioElementRef.current as any).setSinkId(targetOutputId);
-              console.log('Audio routed to output via HTMLAudioElement:', preferredOutput?.label || 'default');
             }
           }
         } catch (err) {
@@ -310,7 +273,6 @@ export function useAudioTranslation() {
       
       const source = inputAudioCtx.createMediaStreamSource(stream);
       
-      // 6. Input audio filter chain
       const highpass = inputAudioCtx.createBiquadFilter();
       highpass.type = 'highpass';
       highpass.frequency.value = 80;
@@ -324,7 +286,7 @@ export function useAudioTranslation() {
       const worklet = new AudioWorkletNode(inputAudioCtx, 'audio-processor', {
         processorOptions: {
           sampleRate: inputAudioCtx.sampleRate,
-          chunkSize: 480
+          chunkSize: 1600
         }
       });
       workletRef.current = worklet;
@@ -338,20 +300,17 @@ export function useAudioTranslation() {
       lowpass.connect(analyser);
       analyser.connect(worklet);
       
-      // Connect worklet to a silent gain node to ensure it processes
       const gainNode = inputAudioCtx.createGain();
       gainNode.gain.value = 0;
       worklet.connect(gainNode);
       gainNode.connect(inputAudioCtx.destination);
       
-      // Volume monitoring for UI visualizer
       const timeData = new Float32Array(analyser.fftSize);
       const outputTimeData = new Float32Array(outputAnalyser.fftSize);
       
       const updateVolume = () => {
         if (!analyserRef.current) return;
         
-        // Input Volume
         analyserRef.current.getFloatTimeDomainData(timeData);
         let sumSquares = 0;
         for (let i = 0; i < timeData.length; i++) {
@@ -362,7 +321,6 @@ export function useAudioTranslation() {
         const mappedVolume = Math.max(0, Math.min(100, (db + 100) * (100 / 100)));
         setVolume(mappedVolume);
 
-        // Output Volume
         if (outputAnalyserRef.current) {
           outputAnalyserRef.current.getFloatTimeDomainData(outputTimeData);
           let outSumSquares = 0;
@@ -379,7 +337,6 @@ export function useAudioTranslation() {
       };
       updateVolume();
 
-      console.log('Connecting directly to Gemini Live API...');
       const ai = new GoogleGenAI({ 
         apiKey: process.env.NEXT_PUBLIC_GEMINI_API_KEY || ''
       });
@@ -394,13 +351,12 @@ export function useAudioTranslation() {
             
             sessionPromise.then((session) => {
               worklet.port.onmessage = (event) => {
-                const pcm16Array = event.data; // Int16Array
+                const pcm16Array = event.data; 
                 
-                // Convert Int16Array to base64
                 const buffer = new ArrayBuffer(pcm16Array.length * 2);
                 const view = new DataView(buffer);
                 for (let i = 0; i < pcm16Array.length; i++) {
-                  view.setInt16(i * 2, pcm16Array[i], true); // little-endian
+                  view.setInt16(i * 2, pcm16Array[i], true); 
                 }
                 
                 let binary = '';
@@ -424,10 +380,7 @@ export function useAudioTranslation() {
             if (!message.serverContent) return;
             const { modelTurn, turnComplete, inputTranscription, outputTranscription } = message.serverContent;
             
-            // 1. Audio Playback
             if (modelTurn && modelTurn.parts) {
-              lastModelActivityRef.current = Date.now();
-              isCommittedRef.current = false;
               const audioParts = modelTurn.parts.filter((p: any) => p.inlineData && p.inlineData.mimeType.startsWith('audio/pcm'));
               for (const part of audioParts) {
                 if (part.inlineData?.data) {
@@ -436,20 +389,13 @@ export function useAudioTranslation() {
               }
             }
 
-            // 2. Source Transcript (Input)
             if (inputTranscription && inputTranscription.text) {
-              lastModelActivityRef.current = Date.now();
-              isCommittedRef.current = false;
               currentSourceTextRef.current += inputTranscription.text;
             }
 
-            // 3. Translation Transcript (Output)
             if (outputTranscription && outputTranscription.text) {
-              lastModelActivityRef.current = Date.now();
-              isCommittedRef.current = false;
               let text = outputTranscription.text;
               
-              // Safety Filter: Block meta-commentary if the model ignores the prompt
               const metaBlocklist = ["i have", "successfully", "translating", "here is", "interpreter"];
               const lowerText = text.toLowerCase();
               if (metaBlocklist.some(word => lowerText.startsWith(word))) {
@@ -463,6 +409,7 @@ export function useAudioTranslation() {
               }
             }
             
+            // Exclusively rely on the server signaling the turn is finished
             if (turnComplete) {
               commitTranscript();
             }
@@ -474,9 +421,6 @@ export function useAudioTranslation() {
           },
           onerror: (err) => {
             console.error('Live API error:', err);
-            if (err instanceof Error) {
-              console.error('Live API error details:', err.message, err.stack);
-            }
             setError('Connection error occurred.');
             setState('DISCONNECTED');
             setActiveDeviceLabel(null);
@@ -487,9 +431,14 @@ export function useAudioTranslation() {
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: useAudioStore.getState().voiceName } },
           },
+          realtimeInputConfig: {
+            automaticActivityDetection: {
+              disabled: true
+            }
+          },
           outputAudioTranscription: {},
           inputAudioTranscription: {},
-          systemInstruction: SYSTEM_INSTRUCTION,
+          systemInstruction: SYSTEM_INSTRUCTION
         },
       });
       
@@ -499,7 +448,6 @@ export function useAudioTranslation() {
       console.error('Error starting session:', err);
       setError('Could not start translation session.');
       
-      // Cleanup
       if (deviceChangeListenerRef.current) {
         navigator.mediaDevices.removeEventListener('devicechange', deviceChangeListenerRef.current);
         deviceChangeListenerRef.current = null;
